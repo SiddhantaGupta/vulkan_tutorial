@@ -1,0 +1,5 @@
+-xc
+-std=c23
+-Wall
+-I~/.local/bin/1.4.350.1/x86_64/include
+
