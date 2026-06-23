@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -std=c23 -Wall -g
 LDFLAGS =
-LIBS = -lvulkan -lglfw -lm
+LIBS = -lvulkan -lglfw -lcglm -lm
 
 SRCS = main.c
 

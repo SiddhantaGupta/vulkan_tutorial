@@ -1,12 +1,14 @@
+#include <cglm/types.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "vulkan/vulkan_core.h"
-
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#include <cglm/cglm.h>
+
+#include "vulkan/vulkan_core.h"
 
 #define CLAMP(val, min, max) ((val) < (min) ? (min) : ((val) > (max) ? (max) : (val)))
 
@@ -48,11 +50,29 @@ typedef struct Vulkan_Context {
     VkSemaphore present_complete_semaphores[MAX_FRAMES_IN_FLIGHT];
     VkSemaphore *render_finished_semaphores;
     VkFence in_flight_fences[MAX_FRAMES_IN_FLIGHT];
+    VkBuffer vertex_buffer;
+    VkDeviceMemory vertex_buffer_memory;
+    VkBuffer index_buffer;
+    VkDeviceMemory index_buffer_memory;
     uint32_t frame_index;
 } Vulkan_Context;
 
 // NOTE: This should not be global but we'll keep it as global for ease.
 Vulkan_Context ctx = { 0 };
+
+typedef struct Vertex {
+    vec2 pos;
+    vec3 color;
+} Vertex;
+
+const Vertex vertices[] = {
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+
+const uint16_t indices[] = { 0, 1, 2, 2, 3, 0 };
 
 void framebufferResizeCallback(GLFWwindow *window, int width, int height) {
     ctx.frame_buffer_resized = true;
@@ -568,14 +588,33 @@ void create_graphics_pipeline() {
     };
     VkPipelineShaderStageCreateInfo shader_stages[] = { vert_shader_stage_info, frag_shader_stage_info };
 
+    VkVertexInputBindingDescription vertex_input_binding_desc = {
+        .binding = 0,
+        .stride = sizeof(Vertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    };
+    uint32_t vertex_input_attribute_count = 2;
+    VkVertexInputAttributeDescription vertex_input_attribute_desc[vertex_input_attribute_count] = {};
+    vertex_input_attribute_desc[0] = (VkVertexInputAttributeDescription){
+        .location = 0,
+        .binding = 0,
+        .format = VK_FORMAT_R32G32_SFLOAT,
+        .offset = offsetof(Vertex, pos)
+    };
+    vertex_input_attribute_desc[1] = (VkVertexInputAttributeDescription){
+        .location = 1,
+        .binding = 0,
+        .format = VK_FORMAT_R32G32B32_SFLOAT,
+        .offset = offsetof(Vertex, color)
+    };
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .pNext = NULL,
         .flags = 0,
-        .vertexBindingDescriptionCount = 0,
-        .pVertexBindingDescriptions = NULL,
-        .vertexAttributeDescriptionCount = 0,
-        .pVertexAttributeDescriptions = NULL
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &vertex_input_binding_desc,
+        .vertexAttributeDescriptionCount = vertex_input_attribute_count,
+        .pVertexAttributeDescriptions = vertex_input_attribute_desc
     };
 
     VkPipelineInputAssemblyStateCreateInfo input_assembly = {
@@ -732,6 +771,151 @@ void create_command_pool() {
     }
 }
 
+void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+        VkBuffer *buffer, VkDeviceMemory *buffer_memory) {
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    vkCreateBuffer(ctx.device, &buffer_info, NULL, buffer);
+
+    VkMemoryRequirements mem_req;
+    vkGetBufferMemoryRequirements(ctx.device, *buffer, &mem_req);
+
+    VkPhysicalDeviceMemoryProperties mem_props;
+    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
+
+    int mem_index = -1;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((mem_req.memoryTypeBits & (1 << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
+            mem_index = i;
+        }
+    }
+
+    if (mem_index < 0) {
+        fprintf(stderr, "Failed to find suitable memory\n");
+    }
+
+    VkMemoryAllocateInfo mem_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = NULL,
+        .allocationSize = mem_req.size,
+        .memoryTypeIndex = mem_index,
+    };
+
+    if (vkAllocateMemory(ctx.device, &mem_alloc_info, NULL, buffer_memory) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to allocate memory for buffer");
+    }
+
+    if (vkBindBufferMemory(ctx.device, *buffer, *buffer_memory, 0) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to bind memory to buffer");
+    }
+}
+
+void copy_buffer(VkBuffer src_buf, VkBuffer dst_buf, VkDeviceSize size) {
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .pNext = NULL,
+        .commandPool = ctx.command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+
+    VkCommandBuffer copy_command_buffer;
+    if (vkAllocateCommandBuffers(ctx.device, &alloc_info, &copy_command_buffer) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to allocate copy command buffer!\n");
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    if (vkBeginCommandBuffer(copy_command_buffer, &beginInfo) != VK_SUCCESS) {
+        fprintf(stderr, "failed to begin recording copy command buffer!\n");
+    }
+
+    VkBufferCopy copy_region = {0};
+    copy_region.srcOffset = 0;
+    copy_region.dstOffset = 0;
+    copy_region.size      = size;
+
+    vkCmdCopyBuffer(copy_command_buffer, src_buf, dst_buf, 1, &copy_region);
+
+    if (vkEndCommandBuffer(copy_command_buffer) != VK_SUCCESS) {
+        fprintf(stderr, "failed to record copy command buffer!\n");
+    }
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &copy_command_buffer
+    };
+
+    if (vkQueueSubmit(ctx.graphics_queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
+        fprintf(stderr, "failed to submit copy command buffer to queue!\n");
+    }
+
+    vkQueueWaitIdle(ctx.graphics_queue);
+}
+
+void create_vertex_buffer() {
+    VkDeviceSize buffer_size = sizeof(vertices);
+
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_buffer_memory;
+    create_buffer(buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer, &staging_buffer_memory);
+
+    void *data;
+    vkMapMemory(ctx.device, staging_buffer_memory, 0, buffer_size, 0, &data);
+    memcpy(data, vertices, buffer_size);
+    vkUnmapMemory(ctx.device, staging_buffer_memory);
+
+    create_buffer(buffer_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.vertex_buffer, &ctx.vertex_buffer_memory);
+
+    copy_buffer(staging_buffer, ctx.vertex_buffer, buffer_size);
+    if (staging_buffer_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, staging_buffer_memory, NULL);
+    }
+    if (staging_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(ctx.device, staging_buffer, NULL);
+    }
+}
+
+void create_index_buffer() {
+    VkDeviceSize buffer_size = sizeof(indices);
+
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_buffer_memory;
+    create_buffer(buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer, &staging_buffer_memory);
+
+    void *data;
+    vkMapMemory(ctx.device, staging_buffer_memory, 0, buffer_size, 0, &data);
+    memcpy(data, indices, buffer_size);
+    vkUnmapMemory(ctx.device, staging_buffer_memory);
+
+    create_buffer(buffer_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.index_buffer, &ctx.index_buffer_memory);
+
+    copy_buffer(staging_buffer, ctx.index_buffer, buffer_size);
+    if (staging_buffer_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, staging_buffer_memory, NULL);
+    }
+    if (staging_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(ctx.device, staging_buffer, NULL);
+    }
+}
+
 void transition_image_layout( uint32_t image_index, VkImageLayout old_layout,
     VkImageLayout new_layout, VkAccessFlags2 src_access_mask, VkAccessFlags2 dst_access_mask,
     VkPipelineStageFlags2 src_stage_mask, VkPipelineStageFlags2 dst_stage_mask) {
@@ -824,6 +1008,8 @@ void record_command_buffer(uint32_t image_index) {
 
     vkCmdBeginRendering(ctx.command_buffers[ctx.frame_index], &rendering_info);
     vkCmdBindPipeline(ctx.command_buffers[ctx.frame_index], VK_PIPELINE_BIND_POINT_GRAPHICS, ctx.graphics_pipeline);
+    vkCmdBindVertexBuffers(ctx.command_buffers[ctx.frame_index], 0, 1, &ctx.vertex_buffer, (VkDeviceSize[]){0});
+    vkCmdBindIndexBuffer(ctx.command_buffers[ctx.frame_index], ctx.index_buffer, 0, VK_INDEX_TYPE_UINT16);
     VkViewport viewport = {
         .x = 0.0f,
         .y = 0.0f,
@@ -838,7 +1024,7 @@ void record_command_buffer(uint32_t image_index) {
         .extent = ctx.swapchain_extent
     };
     vkCmdSetScissor(ctx.command_buffers[ctx.frame_index], 0, 1, &scissor);
-    vkCmdDraw(ctx.command_buffers[ctx.frame_index], 3, 1, 0, 0);
+    vkCmdDrawIndexed(ctx.command_buffers[ctx.frame_index], sizeof(indices) / sizeof(indices[0]), 1, 0, 0, 0);
     vkCmdEndRendering(ctx.command_buffers[ctx.frame_index]);
 
     transition_image_layout(image_index,
@@ -941,6 +1127,8 @@ void init_vulkan() {
     create_image_views();
     create_graphics_pipeline();
     create_command_pool();
+    create_vertex_buffer();
+    create_index_buffer();
     create_command_buffers();
     create_sync_objects();
 }
@@ -1031,7 +1219,6 @@ void draw_frame() {
         recreate_swap_chain();
     } else if (vk_result != VK_SUCCESS) {
         fprintf(stderr, "Failed to present swapchain image! Error code: %d\n", vk_result);
-        exit(EXIT_FAILURE);
     }
 
     ctx.frame_index = (ctx.frame_index + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -1046,6 +1233,18 @@ void main_loop() {
 }
 
 void cleanup() {
+    if (ctx.index_buffer_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, ctx.index_buffer_memory, NULL);
+    }
+    if (ctx.index_buffer  != VK_NULL_HANDLE) {
+        vkDestroyBuffer(ctx.device, ctx.index_buffer, NULL);
+    }
+    if (ctx.vertex_buffer_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, ctx.vertex_buffer_memory, NULL);
+    }
+    if (ctx.vertex_buffer  != VK_NULL_HANDLE) {
+        vkDestroyBuffer(ctx.device, ctx.vertex_buffer, NULL);
+    }
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         if (ctx.present_complete_semaphores[i] != VK_NULL_HANDLE) {
             vkDestroySemaphore(ctx.device, ctx.present_complete_semaphores[i], NULL);
