@@ -13,6 +13,9 @@
 #include <cglm/types.h>
 #include <cglm/affine-pre.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "libs/stb_image.h"
+
 #include "vulkan/vulkan_core.h"
 
 #define CLAMP(val, min, max) ((val) < (min) ? (min) : ((val) > (max) ? (max) : (val)))
@@ -65,6 +68,11 @@ typedef struct Vulkan_Context {
     VkDescriptorSetLayout descriptor_set_layout;
     VkDescriptorPool descriptor_pool;
     VkDescriptorSet descriptor_sets[MAX_FRAMES_IN_FLIGHT];
+    VkImage texture_image;
+    VkDeviceMemory texture_image_memory;
+    uint32_t texture_image_view_count;
+    VkImageView texture_image_view;
+    VkSampler texture_sampler;
     uint32_t frame_index;
 } Vulkan_Context;
 
@@ -74,19 +82,18 @@ typedef struct UniformBufferObject {
     alignas(16) mat4 proj;
 } UniformBufferObject;
 
-// NOTE: This should not be global but we'll keep it as global for ease.
 Vulkan_Context ctx = { 0 };
 
 typedef struct Vertex {
     vec2 pos;
-    vec3 color;
+    vec2 tex_coord;
 } Vertex;
 
 const Vertex vertices[] = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+    {{-0.5f, -0.5f}, {1.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f}}
 };
 
 const uint16_t indices[] = { 0, 1, 2, 2, 3, 0 };
@@ -190,7 +197,7 @@ bool is_device_suitable() {
         }
 
         if (!found) {
-            suppports_required_extensions = false; // Missing a required extension!
+            suppports_required_extensions = false;
             printf("Required device extension not supported: %s\n", required_device_extensions[i]);
             break;
         }
@@ -218,8 +225,9 @@ bool is_device_suitable() {
 
     vkGetPhysicalDeviceFeatures2(ctx.physical_device, &features_2);
 
-    int supports_required_features = features_11.shaderDrawParameters &&
-        features_13.dynamicRendering && features_ext.extendedDynamicState;
+    int supports_required_features = features_2.features.samplerAnisotropy &&
+        features_11.shaderDrawParameters && features_13.dynamicRendering &&
+        features_ext.extendedDynamicState;
 
     return supports_vk_1_3 && supports_graphics && suppports_required_extensions && supports_required_features;
 }
@@ -291,6 +299,9 @@ void create_logical_device() {
 
     VkPhysicalDeviceFeatures2 features_2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .features = {
+            .samplerAnisotropy = VK_TRUE
+        },
         .pNext = &features_ext
     };
 
@@ -435,7 +446,6 @@ int create_instance() {
         }
     }
 
-
     VkApplicationInfo app_info = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pNext = NULL,
@@ -503,15 +513,14 @@ int create_instance() {
     return 0;
 }
 
-void create_image_views() {
-    ctx.swapchain_image_views = malloc(ctx.swapchain_image_count * sizeof(VkImageView));
-
-    VkImageViewCreateInfo image_view_create_info = {
+VkImageView create_image_view(VkImage image, VkFormat format) {
+    VkImageViewCreateInfo view_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = NULL,
         .flags = 0,
+        .image = image,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = ctx.swapchain_surface_format.format,
+        .format = format,
         .components = {
             .r = VK_COMPONENT_SWIZZLE_IDENTITY,
             .g = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -523,18 +532,25 @@ void create_image_views() {
             .baseMipLevel = 0,
             .levelCount = 1,
             .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
+            .layerCount = 1
+        }
     };
 
-    for (uint32_t i = 0; i < ctx.swapchain_image_count; ++i) {
-        image_view_create_info.image = ctx.swapchain_images[i];
-        VkResult vk_result = vkCreateImageView(ctx.device, &image_view_create_info,
-                NULL, &ctx.swapchain_image_views[i]);
+    VkImageView image_view;
+    if (vkCreateImageView(ctx.device, &view_info, NULL, &image_view) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create vulkan image view!\n");
+    }
 
-        if (vk_result != VK_SUCCESS) {
-            fprintf(stderr, "Failed to create image view at index %u! Error: %d\n", i, vk_result);
-        }
+    return image_view;
+}
+
+void create_image_views() {
+    ctx.swapchain_image_views = malloc(ctx.swapchain_image_count * sizeof(VkImageView));
+    for (uint32_t i = 0; i < ctx.swapchain_image_count; ++i) {
+        ctx.swapchain_image_views[i] = create_image_view(
+            ctx.swapchain_images[i],
+            ctx.swapchain_surface_format.format
+        );
     }
 }
 
@@ -566,20 +582,29 @@ char* read_file(const char* filename, size_t* out_size) {
 }
 
 void create_descriptor_set_layout() {
-    VkDescriptorSetLayoutBinding ubo_layout_binding = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-        .pImmutableSamplers = NULL,
+    VkDescriptorSetLayoutBinding bindings[] = {
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = NULL
+        },
+        {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = NULL
+        }
     };
 
     VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = NULL,
         .flags = 0,
-        .bindingCount = 1,
-        .pBindings = &ubo_layout_binding,
+        .bindingCount = sizeof(bindings) / sizeof(bindings[0]),
+        .pBindings = bindings
     };
 
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, NULL, &ctx.descriptor_set_layout) != VK_SUCCESS) {
@@ -643,8 +668,8 @@ void create_graphics_pipeline() {
     vertex_input_attribute_desc[1] = (VkVertexInputAttributeDescription){
         .location = 1,
         .binding = 0,
-        .format = VK_FORMAT_R32G32B32_SFLOAT,
-        .offset = offsetof(Vertex, color)
+        .format = VK_FORMAT_R32G32_SFLOAT,
+        .offset = offsetof(Vertex, tex_coord)
     };
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -810,6 +835,19 @@ void create_command_pool() {
     }
 }
 
+int find_memory_type(uint32_t memory_type_bits, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties mem_props;
+    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((memory_type_bits & (1 << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    fprintf(stderr, "Failed to find suitable memory\n");
+    return -1;
+}
+
 void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
         VkBuffer *buffer, VkDeviceMemory *buffer_memory) {
     VkBufferCreateInfo buffer_info = {
@@ -826,26 +864,11 @@ void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryProperty
     VkMemoryRequirements mem_req;
     vkGetBufferMemoryRequirements(ctx.device, *buffer, &mem_req);
 
-    VkPhysicalDeviceMemoryProperties mem_props;
-    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
-
-    int mem_index = -1;
-    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-        if ((mem_req.memoryTypeBits & (1 << i)) &&
-            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
-            mem_index = i;
-        }
-    }
-
-    if (mem_index < 0) {
-        fprintf(stderr, "Failed to find suitable memory\n");
-    }
-
     VkMemoryAllocateInfo mem_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = NULL,
         .allocationSize = mem_req.size,
-        .memoryTypeIndex = mem_index,
+        .memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits, properties),
     };
 
     if (vkAllocateMemory(ctx.device, &mem_alloc_info, NULL, buffer_memory) != VK_SUCCESS) {
@@ -857,7 +880,7 @@ void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryProperty
     }
 }
 
-void copy_buffer(VkBuffer src_buf, VkBuffer dst_buf, VkDeviceSize size) {
+VkCommandBuffer begin_single_time_commands() {
     VkCommandBufferAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .pNext = NULL,
@@ -866,41 +889,246 @@ void copy_buffer(VkBuffer src_buf, VkBuffer dst_buf, VkDeviceSize size) {
         .commandBufferCount = 1
     };
 
-    VkCommandBuffer copy_command_buffer;
-    if (vkAllocateCommandBuffers(ctx.device, &alloc_info, &copy_command_buffer) != VK_SUCCESS) {
-        fprintf(stderr, "Failed to allocate copy command buffer!\n");
+    VkCommandBuffer command_buffer;
+    if (vkAllocateCommandBuffers(ctx.device, &alloc_info, &command_buffer) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to allocate single-time command buffer!\n");
+        exit(EXIT_FAILURE);
     }
 
-    VkCommandBufferBeginInfo beginInfo = {
+    VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        .pNext = NULL,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = NULL
     };
-    if (vkBeginCommandBuffer(copy_command_buffer, &beginInfo) != VK_SUCCESS) {
-        fprintf(stderr, "failed to begin recording copy command buffer!\n");
+
+    if (vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to begin recording single-time command buffer!\n");
+        exit(EXIT_FAILURE);
     }
 
-    VkBufferCopy copy_region = {0};
-    copy_region.srcOffset = 0;
-    copy_region.dstOffset = 0;
-    copy_region.size      = size;
+    return command_buffer;
+}
 
-    vkCmdCopyBuffer(copy_command_buffer, src_buf, dst_buf, 1, &copy_region);
-
-    if (vkEndCommandBuffer(copy_command_buffer) != VK_SUCCESS) {
-        fprintf(stderr, "failed to record copy command buffer!\n");
+void end_single_time_commands(VkCommandBuffer command_buffer) {
+    if (vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to end recording single-time command buffer!\n");
+        exit(EXIT_FAILURE);
     }
 
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = NULL,
+        .waitSemaphoreCount = 0,
+        .pWaitSemaphores = NULL,
+        .pWaitDstStageMask = NULL,
         .commandBufferCount = 1,
-        .pCommandBuffers = &copy_command_buffer
+        .pCommandBuffers = &command_buffer,
+        .signalSemaphoreCount = 0,
+        .pSignalSemaphores = NULL
     };
 
     if (vkQueueSubmit(ctx.graphics_queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
-        fprintf(stderr, "failed to submit copy command buffer to queue!\n");
+        fprintf(stderr, "Failed to submit single-time command buffer to queue!\n");
+        exit(EXIT_FAILURE);
     }
 
     vkQueueWaitIdle(ctx.graphics_queue);
+    vkFreeCommandBuffers(ctx.device, ctx.command_pool, 1, &command_buffer);
+}
+
+void copy_buffer(VkBuffer src_buf, VkBuffer dst_buf, VkDeviceSize size) {
+    VkCommandBuffer copy_command_buffer = begin_single_time_commands();
+    VkBufferCopy copy_region = { .srcOffset = 0, .dstOffset = 0, .size = size };
+    vkCmdCopyBuffer(copy_command_buffer, src_buf, dst_buf, 1, &copy_region);
+    end_single_time_commands(copy_command_buffer);
+}
+
+void create_image(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling,
+        VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage *out_image,
+        VkDeviceMemory *out_image_memory) {
+
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent.width = width,
+        .extent.height = height,
+        .extent.depth = 1,
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = tiling,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    if (vkCreateImage(ctx.device, &image_info, NULL, out_image) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create vulkan image object!\n");
+    }
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(ctx.device, *out_image, &mem_req);
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = NULL,
+        .allocationSize = mem_req.size,
+        .memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits, properties),
+    };
+
+    if (vkAllocateMemory(ctx.device, &alloc_info, NULL, out_image_memory) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to allocate memory for vulkan image!\n");
+    }
+
+    if (vkBindImageMemory(ctx.device, *out_image, *out_image_memory, 0) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to bind memory to vulkan image!\n");
+    }
+}
+
+void transition_image_layout(VkCommandBuffer command_buffer, VkImage image,
+        VkImageLayout old_layout, VkImageLayout new_layout,
+        VkAccessFlags2 src_access_mask, VkAccessFlags2 dst_access_mask,
+        VkPipelineStageFlags2 src_stage_mask, VkPipelineStageFlags2 dst_stage_mask
+        ) {
+    VkImageMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .pNext = NULL,
+        .srcStageMask = src_stage_mask,
+        .srcAccessMask = src_access_mask,
+        .dstStageMask = dst_stage_mask,
+        .dstAccessMask = dst_access_mask,
+        .oldLayout = old_layout,
+        .newLayout = new_layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+
+    VkDependencyInfo dependency_info = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext = NULL,
+        .dependencyFlags = 0,
+        .memoryBarrierCount = 0,
+        .pMemoryBarriers = NULL,
+        .bufferMemoryBarrierCount = 0,
+        .pBufferMemoryBarriers = NULL,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier
+    };
+
+    vkCmdPipelineBarrier2(command_buffer, &dependency_info);
+}
+
+void copy_buffer_to_image(VkCommandBuffer command_buffer, VkBuffer buffer,
+    VkImage image, uint32_t width, uint32_t height) {
+    VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        },
+        .imageOffset = { .x = 0, .y = 0, .z = 0 },
+        .imageExtent = { .width = width, .height = height, .depth = 1 }
+    };
+
+    vkCmdCopyBufferToImage(command_buffer, buffer, image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
+
+void create_texture_image() {
+    int tex_width, tex_height, tex_channels;
+    stbi_uc *pixels    = stbi_load("textures/texture.jpg", &tex_width, &tex_height, &tex_channels, STBI_rgb_alpha);
+    VkDeviceSize image_size = tex_width * tex_height * 4;
+
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_buffer_memory;
+    create_buffer(image_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer, &staging_buffer_memory);
+
+    void *data;
+    if (vkMapMemory(ctx.device, staging_buffer_memory, 0, image_size, 0, &data) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to map staging buffer memory!\n");
+    }
+    memcpy(data, pixels, image_size);
+    vkUnmapMemory(ctx.device, staging_buffer_memory);
+    stbi_image_free(pixels);
+
+    create_image(tex_width, tex_height, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.texture_image, &ctx.texture_image_memory);
+
+    VkCommandBuffer command_buffer = begin_single_time_commands();
+
+    transition_image_layout(command_buffer, ctx.texture_image,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_NONE, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+
+    copy_buffer_to_image(command_buffer, staging_buffer, ctx.texture_image, tex_width, tex_height);
+
+    transition_image_layout(command_buffer, ctx.texture_image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+
+    end_single_time_commands(command_buffer);
+
+    if (staging_buffer_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, staging_buffer_memory, NULL);
+    }
+    if (staging_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(ctx.device, staging_buffer, NULL);
+    }
+}
+
+void create_texture_image_view() {
+    ctx.texture_image_view = create_image_view(ctx.texture_image, VK_FORMAT_R8G8B8A8_SRGB);
+}
+
+
+void create_texture_sampler() {
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(ctx.physical_device, &properties);
+    VkSamplerCreateInfo sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .mipLodBias = 0.0f,
+        .minLod = 0.0f,
+        .maxLod = 0.0f,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .anisotropyEnable = VK_TRUE,
+        .maxAnisotropy = properties.limits.maxSamplerAnisotropy,
+        .compareEnable = VK_FALSE,
+        .compareOp = VK_COMPARE_OP_ALWAYS,
+        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = VK_FALSE
+    };
+
+    if (vkCreateSampler(ctx.device, &sampler_info, NULL, &ctx.texture_sampler) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create texture sampler!\n");
+    }
 }
 
 void create_vertex_buffer() {
@@ -970,17 +1198,24 @@ void create_uniform_buffer() {
 }
 
 void create_descriptor_pool() {
-    VkDescriptorPoolSize pool_size = {
-        .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = MAX_FRAMES_IN_FLIGHT
+    VkDescriptorPoolSize pool_sizes[] = {
+        {
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = MAX_FRAMES_IN_FLIGHT
+        },
+        {
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = MAX_FRAMES_IN_FLIGHT
+        }
     };
+
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = NULL,
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
         .maxSets = MAX_FRAMES_IN_FLIGHT,
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size,
+        .poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
+        .pPoolSizes = pool_sizes
     };
 
     if (vkCreateDescriptorPool(ctx.device, &pool_info, NULL, &ctx.descriptor_pool) != VK_SUCCESS) {
@@ -1006,7 +1241,6 @@ void create_descriptor_sets() {
         fprintf(stderr, "failed to allocate descriptor sets!\n");
     }
 
-
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         VkDescriptorBufferInfo buffer_info = {
             .buffer = ctx.uniform_buffers[i],
@@ -1014,61 +1248,42 @@ void create_descriptor_sets() {
             .range  = sizeof(UniformBufferObject),
         };
 
-        VkWriteDescriptorSet descriptor_write = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = NULL,
-            .dstSet = ctx.descriptor_sets[i],
-            .dstBinding = 0,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .pBufferInfo = &buffer_info,
-            .pImageInfo = NULL,
-            .pTexelBufferView = NULL,
+        VkDescriptorImageInfo image_info = {
+            .sampler = ctx.texture_sampler,
+            .imageView = ctx.texture_image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         };
 
-        vkUpdateDescriptorSets(ctx.device, 1, &descriptor_write, 0, NULL);
+        VkWriteDescriptorSet descriptor_writes[] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = NULL,
+                .dstSet = ctx.descriptor_sets[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &buffer_info,
+                .pImageInfo = NULL,
+                .pTexelBufferView = NULL
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = NULL,
+                .dstSet = ctx.descriptor_sets[i],
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pBufferInfo = NULL,
+                .pImageInfo = &image_info,
+                .pTexelBufferView = NULL
+            }
+        };
+
+        vkUpdateDescriptorSets(ctx.device, sizeof(descriptor_writes) / sizeof(descriptor_writes[0]),
+                descriptor_writes, 0, NULL);
     }
-}
-
-void transition_image_layout( uint32_t image_index, VkImageLayout old_layout,
-    VkImageLayout new_layout, VkAccessFlags2 src_access_mask, VkAccessFlags2 dst_access_mask,
-    VkPipelineStageFlags2 src_stage_mask, VkPipelineStageFlags2 dst_stage_mask) {
-
-    VkImageMemoryBarrier2 barrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .pNext = NULL,
-        .srcStageMask        = src_stage_mask,
-        .srcAccessMask       = src_access_mask,
-        .dstStageMask        = dst_stage_mask,
-        .dstAccessMask       = dst_access_mask,
-        .oldLayout           = old_layout,
-        .newLayout           = new_layout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image               = ctx.swapchain_images[image_index],
-        .subresourceRange    = {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel   = 0,
-            .levelCount     = 1,
-            .baseArrayLayer = 0,
-            .layerCount     = 1
-        }
-    };
-
-    VkDependencyInfo dependency_info = {
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .pNext = NULL,
-        .dependencyFlags         = 0,
-        .memoryBarrierCount      = 0,
-        .pMemoryBarriers         = NULL,
-        .bufferMemoryBarrierCount = 0,
-        .pBufferMemoryBarriers   = NULL,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &barrier
-    };
-
-    vkCmdPipelineBarrier2(ctx.command_buffers[ctx.frame_index], &dependency_info);
 }
 
 void record_command_buffer(uint32_t image_index) {
@@ -1083,7 +1298,7 @@ void record_command_buffer(uint32_t image_index) {
         fprintf(stderr, "Failed to begin recording command buffer! Error code: %d\n", vk_result);
     }
 
-    transition_image_layout(image_index,
+    transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.swapchain_images[image_index],
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             0, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -1144,7 +1359,7 @@ void record_command_buffer(uint32_t image_index) {
     vkCmdDrawIndexed(ctx.command_buffers[ctx.frame_index], sizeof(indices) / sizeof(indices[0]), 1, 0, 0, 0);
     vkCmdEndRendering(ctx.command_buffers[ctx.frame_index]);
 
-    transition_image_layout(image_index,
+    transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.swapchain_images[image_index],
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
@@ -1248,6 +1463,9 @@ void init_vulkan() {
     create_descriptor_set_layout();
     create_graphics_pipeline();
     create_command_pool();
+    create_texture_image();
+    create_texture_image_view();
+    create_texture_sampler();
     create_vertex_buffer();
     create_index_buffer();
     create_uniform_buffer();
@@ -1393,6 +1611,18 @@ void main_loop() {
 }
 
 void cleanup() {
+    if (ctx.texture_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(ctx.device, ctx.texture_sampler, NULL);
+    }
+    if (ctx.texture_image_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(ctx.device, ctx.texture_image_view, NULL);
+    }
+    if (ctx.texture_image != VK_NULL_HANDLE) {
+        vkDestroyImage(ctx.device, ctx.texture_image, NULL);
+    }
+    if (ctx.texture_image_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, ctx.texture_image_memory, NULL);
+    }
     if (ctx.descriptor_pool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(ctx.device, ctx.descriptor_pool, NULL);
     }
