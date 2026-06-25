@@ -7,6 +7,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #include <cglm/cglm.h>
 #include <cglm/mat4.h>
@@ -74,6 +75,10 @@ typedef struct Vulkan_Context {
     VkImageView texture_image_view;
     VkSampler texture_sampler;
     uint32_t frame_index;
+    VkImage depth_image;
+    VkDeviceMemory depth_image_memory;
+    VkImageView depth_image_view;
+    VkFormat depth_format;
 } Vulkan_Context;
 
 typedef struct UniformBufferObject {
@@ -85,18 +90,26 @@ typedef struct UniformBufferObject {
 Vulkan_Context ctx = { 0 };
 
 typedef struct Vertex {
-    vec2 pos;
+    vec3 pos;
     vec2 tex_coord;
 } Vertex;
 
 const Vertex vertices[] = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f}}
+    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}},
+
+    {{-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, -0.5f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, -0.5f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, -0.5f}, {0.0f, 1.0f}}
 };
 
-const uint16_t indices[] = { 0, 1, 2, 2, 3, 0 };
+const uint16_t indices[] = {
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4
+};
 
 void framebufferResizeCallback(GLFWwindow *window, int width, int height) {
     ctx.frame_buffer_resized = true;
@@ -513,7 +526,7 @@ int create_instance() {
     return 0;
 }
 
-VkImageView create_image_view(VkImage image, VkFormat format) {
+VkImageView create_image_view(VkImage image, VkFormat format, VkImageAspectFlagBits aspect_flags) {
     VkImageViewCreateInfo view_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = NULL,
@@ -528,7 +541,7 @@ VkImageView create_image_view(VkImage image, VkFormat format) {
             .a = VK_COMPONENT_SWIZZLE_IDENTITY
         },
         .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .aspectMask = aspect_flags,
             .baseMipLevel = 0,
             .levelCount = 1,
             .baseArrayLayer = 0,
@@ -547,10 +560,8 @@ VkImageView create_image_view(VkImage image, VkFormat format) {
 void create_image_views() {
     ctx.swapchain_image_views = malloc(ctx.swapchain_image_count * sizeof(VkImageView));
     for (uint32_t i = 0; i < ctx.swapchain_image_count; ++i) {
-        ctx.swapchain_image_views[i] = create_image_view(
-            ctx.swapchain_images[i],
-            ctx.swapchain_surface_format.format
-        );
+        ctx.swapchain_image_views[i] = create_image_view(ctx.swapchain_images[i],
+            ctx.swapchain_surface_format.format, VK_IMAGE_ASPECT_COLOR_BIT);
     }
 }
 
@@ -662,7 +673,7 @@ void create_graphics_pipeline() {
     vertex_input_attribute_desc[0] = (VkVertexInputAttributeDescription){
         .location = 0,
         .binding = 0,
-        .format = VK_FORMAT_R32G32_SFLOAT,
+        .format = VK_FORMAT_R32G32B32_SFLOAT,
         .offset = offsetof(Vertex, pos)
     };
     vertex_input_attribute_desc[1] = (VkVertexInputAttributeDescription){
@@ -779,16 +790,30 @@ void create_graphics_pipeline() {
         fprintf(stderr, "Failed to create pipeline layout! Error code: %d\n", vk_result);
     }
 
+    VkPipelineDepthStencilStateCreateInfo depth_stencil = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .depthTestEnable = VK_TRUE,
+        .depthWriteEnable = VK_TRUE,
+        .depthCompareOp = VK_COMPARE_OP_LESS,
+        .depthBoundsTestEnable = VK_FALSE,
+        .stencilTestEnable = VK_FALSE,
+        .front = {0},
+        .back = {0},
+        .minDepthBounds = 0.0f,
+        .maxDepthBounds = 1.0f,
+    };
+
     VkPipelineRenderingCreateInfo pipeline_rendering_create_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .pNext = NULL,
         .viewMask = 0,
         .colorAttachmentCount = 1,
         .pColorAttachmentFormats = &ctx.swapchain_surface_format.format,
-        .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+        .depthAttachmentFormat = ctx.depth_format,
         .stencilAttachmentFormat = VK_FORMAT_UNDEFINED
     };
-
 
     VkGraphicsPipelineCreateInfo pipeline_create_info = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -796,13 +821,14 @@ void create_graphics_pipeline() {
         .flags = 0,
         .stageCount = 2,
         .pStages = shader_stages,
-        .pVertexInputState   = &vertex_input_info,
+        .pVertexInputState = &vertex_input_info,
         .pInputAssemblyState = &input_assembly,
-        .pViewportState      = &viewport_state_create_info,
+        .pViewportState = &viewport_state_create_info,
         .pRasterizationState = &rasterizer_create_info,
-        .pMultisampleState   = &multisampling_create_info,
-        .pColorBlendState    = &color_blend_state_create_info,
-        .pDynamicState       = &dynamic_state_create_info,
+        .pMultisampleState = &multisampling_create_info,
+        .pColorBlendState = &color_blend_state_create_info,
+        .pDynamicState = &dynamic_state_create_info,
+        .pDepthStencilState = &depth_stencil,
         .layout = ctx.pipeline_layout,
         .renderPass = VK_NULL_HANDLE,
         .subpass = 0,
@@ -835,6 +861,25 @@ void create_command_pool() {
     }
 }
 
+VkFormat find_supported_format(const VkFormat* candidates, uint32_t candidates_count,
+        VkImageTiling tiling, VkFormatFeatureFlags features) {
+
+    for (uint32_t i = 0; i < candidates_count; i++) {
+        VkFormat format = candidates[i];
+        VkFormatProperties props;
+        vkGetPhysicalDeviceFormatProperties(ctx.physical_device, format, &props);
+
+        if ((tiling == VK_IMAGE_TILING_LINEAR &&
+            (props.linearTilingFeatures & features) == features) ||
+            (tiling == VK_IMAGE_TILING_OPTIMAL &&
+            (props.optimalTilingFeatures & features) == features)) {
+            return format;
+        }
+    }
+
+    return VK_FORMAT_UNDEFINED;
+}
+
 int find_memory_type(uint32_t memory_type_bits, VkMemoryPropertyFlags properties) {
     VkPhysicalDeviceMemoryProperties mem_props;
     vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
@@ -846,6 +891,68 @@ int find_memory_type(uint32_t memory_type_bits, VkMemoryPropertyFlags properties
     }
     fprintf(stderr, "Failed to find suitable memory\n");
     return -1;
+}
+
+void create_image(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling,
+        VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage *out_image,
+        VkDeviceMemory *out_image_memory) {
+
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent.width = width,
+        .extent.height = height,
+        .extent.depth = 1,
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = tiling,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    if (vkCreateImage(ctx.device, &image_info, NULL, out_image) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create vulkan image object!\n");
+    }
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(ctx.device, *out_image, &mem_req);
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = NULL,
+        .allocationSize = mem_req.size,
+        .memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits, properties),
+    };
+
+    if (vkAllocateMemory(ctx.device, &alloc_info, NULL, out_image_memory) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to allocate memory for vulkan image!\n");
+    }
+
+    if (vkBindImageMemory(ctx.device, *out_image, *out_image_memory, 0) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to bind memory to vulkan image!\n");
+    }
+}
+
+void create_depth_resources() {
+    VkFormat candidates[] = {
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D24_UNORM_S8_UINT
+    };
+
+    ctx.depth_format = find_supported_format(candidates, sizeof(candidates) / sizeof(candidates[0]),
+            VK_IMAGE_TILING_OPTIMAL, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+
+    create_image(ctx.swapchain_extent.width, ctx.swapchain_extent.height, ctx.depth_format,
+            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.depth_image, &ctx.depth_image_memory);
+
+    ctx.depth_image_view = create_image_view(ctx.depth_image, ctx.depth_format, VK_IMAGE_ASPECT_DEPTH_BIT);
 }
 
 void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
@@ -944,56 +1051,11 @@ void copy_buffer(VkBuffer src_buf, VkBuffer dst_buf, VkDeviceSize size) {
     end_single_time_commands(copy_command_buffer);
 }
 
-void create_image(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling,
-        VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage *out_image,
-        VkDeviceMemory *out_image_memory) {
-
-    VkImageCreateInfo image_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext = NULL,
-        .flags = 0,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = format,
-        .extent.width = width,
-        .extent.height = height,
-        .extent.depth = 1,
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = tiling,
-        .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-
-    if (vkCreateImage(ctx.device, &image_info, NULL, out_image) != VK_SUCCESS) {
-        fprintf(stderr, "Failed to create vulkan image object!\n");
-    }
-
-    VkMemoryRequirements mem_req;
-    vkGetImageMemoryRequirements(ctx.device, *out_image, &mem_req);
-
-    VkMemoryAllocateInfo alloc_info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext = NULL,
-        .allocationSize = mem_req.size,
-        .memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits, properties),
-    };
-
-    if (vkAllocateMemory(ctx.device, &alloc_info, NULL, out_image_memory) != VK_SUCCESS) {
-        fprintf(stderr, "Failed to allocate memory for vulkan image!\n");
-    }
-
-    if (vkBindImageMemory(ctx.device, *out_image, *out_image_memory, 0) != VK_SUCCESS) {
-        fprintf(stderr, "Failed to bind memory to vulkan image!\n");
-    }
-}
-
 void transition_image_layout(VkCommandBuffer command_buffer, VkImage image,
         VkImageLayout old_layout, VkImageLayout new_layout,
         VkAccessFlags2 src_access_mask, VkAccessFlags2 dst_access_mask,
-        VkPipelineStageFlags2 src_stage_mask, VkPipelineStageFlags2 dst_stage_mask
-        ) {
+        VkPipelineStageFlags2 src_stage_mask, VkPipelineStageFlags2 dst_stage_mask,
+        VkImageAspectFlags image_aspect_flags) {
     VkImageMemoryBarrier2 barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .pNext = NULL,
@@ -1007,7 +1069,7 @@ void transition_image_layout(VkCommandBuffer command_buffer, VkImage image,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = image,
         .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .aspectMask = image_aspect_flags,
             .baseMipLevel = 0,
             .levelCount = 1,
             .baseArrayLayer = 0,
@@ -1078,14 +1140,15 @@ void create_texture_image() {
     transition_image_layout(command_buffer, ctx.texture_image,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             0, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_NONE, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+            VK_PIPELINE_STAGE_2_NONE, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
 
     copy_buffer_to_image(command_buffer, staging_buffer, ctx.texture_image, tex_width, tex_height);
 
     transition_image_layout(command_buffer, ctx.texture_image,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT);
 
     end_single_time_commands(command_buffer);
 
@@ -1098,7 +1161,7 @@ void create_texture_image() {
 }
 
 void create_texture_image_view() {
-    ctx.texture_image_view = create_image_view(ctx.texture_image, VK_FORMAT_R8G8B8A8_SRGB);
+    ctx.texture_image_view = create_image_view(ctx.texture_image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 
@@ -1301,12 +1364,19 @@ void record_command_buffer(uint32_t image_index) {
     transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.swapchain_images[image_index],
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             0, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+
+    transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.depth_image,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
 
     VkClearValue clear_color = {
         .color = { { 0.0f, 0.0f, 0.0f, 1.0f } }
     };
-
     VkRenderingAttachmentInfo color_attachment_info = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .pNext = NULL,
@@ -1318,6 +1388,25 @@ void record_command_buffer(uint32_t image_index) {
         .resolveMode = VK_RESOLVE_MODE_NONE,
         .resolveImageView = VK_NULL_HANDLE,
         .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+
+    VkClearValue clear_depth = {
+        .depthStencil = {
+            .depth = 1.0f,
+            .stencil = 0
+        }
+    };
+    VkRenderingAttachmentInfo depth_attachment_info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = NULL,
+        .imageView = ctx.depth_image_view,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .clearValue = clear_depth
     };
 
     VkRenderingInfo rendering_info = {
@@ -1332,7 +1421,7 @@ void record_command_buffer(uint32_t image_index) {
         .viewMask = 0,
         .colorAttachmentCount = 1,
         .pColorAttachments = &color_attachment_info,
-        .pDepthAttachment = NULL,
+        .pDepthAttachment = &depth_attachment_info,
         .pStencilAttachment = NULL
     };
 
@@ -1362,7 +1451,8 @@ void record_command_buffer(uint32_t image_index) {
     transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.swapchain_images[image_index],
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT);
 
     vk_result = vkEndCommandBuffer(ctx.command_buffers[ctx.frame_index]);
     if (vk_result != VK_SUCCESS) {
@@ -1419,8 +1509,14 @@ void create_sync_objects() {
 }
 
 void cleanup_swapchain() {
-    if (ctx.descriptor_set_layout != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(ctx.device, ctx.descriptor_set_layout, NULL);
+    if (ctx.depth_image_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(ctx.device, ctx.depth_image_view, NULL);
+    }
+    if (ctx.depth_image != VK_NULL_HANDLE) {
+        vkDestroyImage(ctx.device, ctx.depth_image, NULL);
+    }
+    if (ctx.depth_image_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, ctx.depth_image_memory, NULL);
     }
     if (ctx.swapchain_image_views != VK_NULL_HANDLE) {
         for (uint32_t i = 0; i < ctx.swapchain_image_count; i++) {
@@ -1450,6 +1546,7 @@ void recreate_swap_chain() {
 
     create_swapchain();
     create_image_views();
+    create_depth_resources();
 }
 
 void init_vulkan() {
@@ -1461,6 +1558,7 @@ void init_vulkan() {
     create_swapchain();
     create_image_views();
     create_descriptor_set_layout();
+    create_depth_resources();
     create_graphics_pipeline();
     create_command_pool();
     create_texture_image();
@@ -1670,6 +1768,9 @@ void cleanup() {
         vkDestroyCommandPool(ctx.device, ctx.command_pool, NULL);
     }
     cleanup_swapchain();
+    if (ctx.descriptor_set_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(ctx.device, ctx.descriptor_set_layout, NULL);
+    }
     if (ctx.surface != VK_NULL_HANDLE) {
         vkDestroySurfaceKHR(ctx.instance, ctx.surface, NULL);
     }

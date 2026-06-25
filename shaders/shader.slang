@@ -1,5 +1,5 @@
 struct VS_Input {
-    float2 in_position;
+    float3 in_position;
     float2 in_tex_coord;
 };
 
@@ -20,7 +20,7 @@ struct VS_Output {
 [shader("vertex")]
 VS_Output vert_main(VS_Input input) {
     VS_Output output;
-    output.pos = mul(ubo.proj, mul(ubo.view, mul(ubo.model, float4(input.in_position, 0.0, 1.0))));
+    output.pos = mul(ubo.proj, mul(ubo.view, mul(ubo.model, float4(input.in_position, 1.0))));
     output.frag_tex_coord = input.in_tex_coord;
     return output;
 }
