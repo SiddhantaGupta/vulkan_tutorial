@@ -104,9 +104,13 @@ typedef struct Vulkan_Context {
     VkDeviceMemory depth_image_memory;
     VkImageView depth_image_view;
     VkFormat depth_format;
+    VkSampleCountFlagBits msaa_samples;
+    VkImage color_image;
+    VkDeviceMemory color_image_memory;
+    VkImageView color_image_view;
 } Vulkan_Context;
 
-Vulkan_Context ctx = { 0 };
+Vulkan_Context ctx = {0};
 
 typedef struct UniformBufferObject {
     alignas(16) mat4 model;
@@ -248,6 +252,23 @@ bool is_device_suitable() {
     return supports_vk_1_3 && supports_graphics && suppports_required_extensions && supports_required_features;
 }
 
+VkSampleCountFlagBits get_max_usable_sample_count() {
+    VkPhysicalDeviceProperties physical_device_properties;
+    vkGetPhysicalDeviceProperties(ctx.physical_device, &physical_device_properties);
+
+    VkSampleCountFlags counts = physical_device_properties.limits.framebufferColorSampleCounts & physical_device_properties.limits.
+        framebufferDepthSampleCounts;
+
+    if (counts & VK_SAMPLE_COUNT_64_BIT) { return VK_SAMPLE_COUNT_64_BIT; }
+    if (counts & VK_SAMPLE_COUNT_32_BIT) { return VK_SAMPLE_COUNT_32_BIT; }
+    if (counts & VK_SAMPLE_COUNT_16_BIT) { return VK_SAMPLE_COUNT_16_BIT; }
+    if (counts & VK_SAMPLE_COUNT_8_BIT) { return VK_SAMPLE_COUNT_8_BIT; }
+    if (counts & VK_SAMPLE_COUNT_4_BIT) { return VK_SAMPLE_COUNT_4_BIT; }
+    if (counts & VK_SAMPLE_COUNT_2_BIT) { return VK_SAMPLE_COUNT_2_BIT; }
+
+    return VK_SAMPLE_COUNT_1_BIT;
+}
+
 void pick_physical_device() {
     uint32_t physical_device_count;
     vkEnumeratePhysicalDevices(ctx.instance, &physical_device_count, NULL);
@@ -260,6 +281,8 @@ void pick_physical_device() {
     if (!is_device_suitable()) {
         fprintf(stderr, "No Suitable devies found");
     }
+
+    ctx.msaa_samples = get_max_usable_sample_count();
 }
 
 void create_logical_device() {
@@ -627,6 +650,75 @@ void create_descriptor_set_layout() {
     }
 }
 
+int find_memory_type(uint32_t memory_type_bits, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties mem_props;
+    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((memory_type_bits & (1 << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    fprintf(stderr, "Failed to find suitable memory\n");
+    return -1;
+}
+
+void create_image(uint32_t width, uint32_t height, uint32_t mip_levels, VkSampleCountFlagBits num_samples,
+        VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties,
+        VkImage *out_image, VkDeviceMemory *out_image_memory) {
+
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent.width = width,
+        .extent.height = height,
+        .extent.depth = 1,
+        .mipLevels = mip_levels,
+        .arrayLayers = 1,
+        .samples = num_samples,
+        .tiling = tiling,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    if (vkCreateImage(ctx.device, &image_info, NULL, out_image) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create vulkan image object!\n");
+    }
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(ctx.device, *out_image, &mem_req);
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = NULL,
+        .allocationSize = mem_req.size,
+        .memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits, properties),
+    };
+
+    if (vkAllocateMemory(ctx.device, &alloc_info, NULL, out_image_memory) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to allocate memory for vulkan image!\n");
+    }
+
+    if (vkBindImageMemory(ctx.device, *out_image, *out_image_memory, 0) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to bind memory to vulkan image!\n");
+    }
+}
+
+void create_color_resources() {
+    VkFormat color_format = ctx.swapchain_surface_format.format;
+
+    create_image(ctx.swapchain_extent.width, ctx.swapchain_extent.height, 1, ctx.msaa_samples,
+            color_format, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.color_image, &ctx.color_image_memory);
+
+    ctx.color_image_view = create_image_view(ctx.color_image, color_format, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+}
+
 void create_graphics_pipeline() {
     size_t out_size = 0;
     char *shader_code = read_file("shaders/slang.spv", &out_size);
@@ -745,7 +837,7 @@ void create_graphics_pipeline() {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .pNext = NULL,
         .flags = 0,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .rasterizationSamples = ctx.msaa_samples,
         .sampleShadingEnable = VK_FALSE,
         .minSampleShading = 1.0f,
         .pSampleMask = NULL,
@@ -884,64 +976,6 @@ VkFormat find_supported_format(const VkFormat* candidates, uint32_t candidates_c
     return VK_FORMAT_UNDEFINED;
 }
 
-int find_memory_type(uint32_t memory_type_bits, VkMemoryPropertyFlags properties) {
-    VkPhysicalDeviceMemoryProperties mem_props;
-    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
-    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-        if ((memory_type_bits & (1 << i)) &&
-            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
-        }
-    }
-    fprintf(stderr, "Failed to find suitable memory\n");
-    return -1;
-}
-
-void create_image(uint32_t width, uint32_t height, uint32_t mip_levels, VkFormat format, VkImageTiling tiling,
-        VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage *out_image,
-        VkDeviceMemory *out_image_memory) {
-
-    VkImageCreateInfo image_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext = NULL,
-        .flags = 0,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = format,
-        .extent.width = width,
-        .extent.height = height,
-        .extent.depth = 1,
-        .mipLevels = mip_levels,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = tiling,
-        .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-
-    if (vkCreateImage(ctx.device, &image_info, NULL, out_image) != VK_SUCCESS) {
-        fprintf(stderr, "Failed to create vulkan image object!\n");
-    }
-
-    VkMemoryRequirements mem_req;
-    vkGetImageMemoryRequirements(ctx.device, *out_image, &mem_req);
-
-    VkMemoryAllocateInfo alloc_info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext = NULL,
-        .allocationSize = mem_req.size,
-        .memoryTypeIndex = find_memory_type(mem_req.memoryTypeBits, properties),
-    };
-
-    if (vkAllocateMemory(ctx.device, &alloc_info, NULL, out_image_memory) != VK_SUCCESS) {
-        fprintf(stderr, "Failed to allocate memory for vulkan image!\n");
-    }
-
-    if (vkBindImageMemory(ctx.device, *out_image, *out_image_memory, 0) != VK_SUCCESS) {
-        fprintf(stderr, "Failed to bind memory to vulkan image!\n");
-    }
-}
-
 void create_depth_resources() {
     VkFormat candidates[] = {
         VK_FORMAT_D32_SFLOAT,
@@ -952,8 +986,8 @@ void create_depth_resources() {
     ctx.depth_format = find_supported_format(candidates, sizeof(candidates) / sizeof(candidates[0]),
             VK_IMAGE_TILING_OPTIMAL, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
 
-    create_image(ctx.swapchain_extent.width, ctx.swapchain_extent.height, 1, ctx.depth_format,
-            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+    create_image(ctx.swapchain_extent.width, ctx.swapchain_extent.height, 1, ctx.msaa_samples,
+            ctx.depth_format, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.depth_image, &ctx.depth_image_memory);
 
     ctx.depth_image_view = create_image_view(ctx.depth_image, ctx.depth_format, VK_IMAGE_ASPECT_DEPTH_BIT, 1);
@@ -1251,7 +1285,7 @@ void create_texture_image() {
     vkUnmapMemory(ctx.device, staging_buffer_memory);
     stbi_image_free(pixels);
 
-    create_image(tex_width, tex_height, ctx.mip_levels, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL,
+    create_image(tex_width, tex_height, ctx.mip_levels, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.texture_image, &ctx.texture_image_memory);
 
@@ -1529,6 +1563,12 @@ void record_command_buffer(uint32_t image_index) {
         fprintf(stderr, "Failed to begin recording command buffer! Error code: %d\n", vk_result);
     }
 
+    transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.color_image,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            0, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT, 1);
+
     transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.swapchain_images[image_index],
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             0, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1548,14 +1588,14 @@ void record_command_buffer(uint32_t image_index) {
     VkRenderingAttachmentInfo color_attachment_info = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .pNext = NULL,
-        .imageView = ctx.swapchain_image_views[image_index],
+        .imageView = ctx.color_image_view,
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .clearValue = clear_color,
-        .resolveMode = VK_RESOLVE_MODE_NONE,
-        .resolveImageView = VK_NULL_HANDLE,
-        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED
+        .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+        .resolveImageView = ctx.swapchain_image_views[image_index],
+        .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
     };
 
     VkClearValue clear_depth = {
@@ -1677,6 +1717,18 @@ void create_sync_objects() {
 }
 
 void cleanup_swapchain() {
+    if (ctx.color_image_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(ctx.device, ctx.color_image_view, NULL);
+        ctx.color_image_view = VK_NULL_HANDLE;
+    }
+    if (ctx.color_image != VK_NULL_HANDLE) {
+        vkDestroyImage(ctx.device, ctx.color_image, NULL);
+        ctx.color_image = VK_NULL_HANDLE;
+    }
+    if (ctx.color_image_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, ctx.color_image_memory, NULL);
+        ctx.color_image_memory = VK_NULL_HANDLE;
+    }
     if (ctx.depth_image_view != VK_NULL_HANDLE) {
         vkDestroyImageView(ctx.device, ctx.depth_image_view, NULL);
     }
@@ -1714,6 +1766,7 @@ void recreate_swap_chain() {
 
     create_swapchain();
     create_image_views();
+    create_color_resources();
     create_depth_resources();
 }
 
@@ -1726,6 +1779,7 @@ void init_vulkan() {
     create_swapchain();
     create_image_views();
     create_descriptor_set_layout();
+    create_color_resources();
     create_depth_resources();
     create_graphics_pipeline();
     create_command_pool();
@@ -1743,16 +1797,7 @@ void init_vulkan() {
 }
 
 void update_uniform_buffer(uint32_t current_image) {
-    static struct timespec startTime;
-    static int initialized = 0;
-    if (!initialized) {
-        timespec_get(&startTime, TIME_UTC);
-        initialized = 1;
-    }
-    struct timespec currentTime;
-    timespec_get(&currentTime, TIME_UTC);
-    float time = (float)(currentTime.tv_sec - startTime.tv_sec) +
-                 (float)(currentTime.tv_nsec - startTime.tv_nsec) / 1000000000.0f;
+    float time = (float)glfwGetTime();
 
     UniformBufferObject ubo = {0};
 
@@ -1824,7 +1869,7 @@ void draw_frame() {
         .pNext = NULL,
         .semaphore = ctx.render_finished_semaphores[image_index],
         .value = 0,
-        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
         .deviceIndex = 0
     };
 
