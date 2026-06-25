@@ -35,6 +35,7 @@
 )
 
 constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+constexpr uint16_t PARTICLE_COUNT = 8192;
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 const char *MODEL_PATH = "models/viking_room.obj";
@@ -53,6 +54,12 @@ typedef struct Vertex {
     vec3 pos;
     vec2 tex_coord;
 } Vertex;
+
+typedef struct Particle {
+	vec2 position;
+	vec2 velocity;
+    vec4 color;
+} Particle;
 
 typedef struct Vulkan_Context {
     GLFWwindow *window;
@@ -108,6 +115,13 @@ typedef struct Vulkan_Context {
     VkImage color_image;
     VkDeviceMemory color_image_memory;
     VkImageView color_image_view;
+    VkDescriptorPool compute_descriptor_pool;
+    VkDescriptorSet compute_descriptor_sets[MAX_FRAMES_IN_FLIGHT];
+    VkDescriptorSetLayout compute_descriptor_set_layout;
+    VkPipelineLayout compute_pipeline_layout;
+    VkPipeline compute_pipeline;
+    VkBuffer shader_storage_buffers[MAX_FRAMES_IN_FLIGHT];
+    VkDeviceMemory shader_storage_buffers_memory[MAX_FRAMES_IN_FLIGHT];
 } Vulkan_Context;
 
 Vulkan_Context ctx = {0};
@@ -116,6 +130,7 @@ typedef struct UniformBufferObject {
     alignas(16) mat4 model;
     alignas(16) mat4 view;
     alignas(16) mat4 proj;
+    alignas(16) float delta_time;
 } UniformBufferObject;
 
 void framebufferResizeCallback(GLFWwindow *window, int width, int height) {
@@ -296,7 +311,9 @@ void create_logical_device() {
     for (uint32_t i = 0; i < q_family_property_count; ++i) {
         VkBool32 supports_present = false;
         vkGetPhysicalDeviceSurfaceSupportKHR(ctx.physical_device, i, ctx.surface, &supports_present);
-        if ((q_family_properties[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && supports_present) {
+        if ((q_family_properties[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+                (q_family_properties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+                supports_present) {
             ctx.graphics_queue_index = i;
             break;
         }
@@ -719,6 +736,184 @@ void create_color_resources() {
     ctx.color_image_view = create_image_view(ctx.color_image, color_format, VK_IMAGE_ASPECT_COLOR_BIT, 1);
 }
 
+void create_compute_descriptor_set_layout() {
+    VkDescriptorSetLayoutBinding bindings[3] = {
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = NULL
+        },
+        {
+            .binding = 2,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = NULL
+        },
+        {
+            .binding = 3,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = NULL
+        }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .bindingCount = 3,
+        .pBindings = bindings
+    };
+
+    if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, NULL, &ctx.compute_descriptor_set_layout) != VK_SUCCESS) {
+        fprintf(stderr, "failed to create compute descriptor set layout!\n");
+    }
+}
+
+void create_compute_descriptor_sets() {
+    VkDescriptorSetLayout layouts[MAX_FRAMES_IN_FLIGHT];
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        layouts[i] = ctx.compute_descriptor_set_layout;
+    }
+
+    VkDescriptorSetAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .pNext = NULL,
+        .descriptorPool = ctx.compute_descriptor_pool,
+        .descriptorSetCount = MAX_FRAMES_IN_FLIGHT,
+        .pSetLayouts = layouts,
+    };
+
+    if (vkAllocateDescriptorSets(ctx.device, &alloc_info, ctx.compute_descriptor_sets) != VK_SUCCESS) {
+        fprintf(stderr, "failed to allocate compute descriptor sets!\n");
+    }
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        VkDescriptorBufferInfo uniform_buffer_info = {
+            .buffer = ctx.uniform_buffers[i],
+            .offset = 0,
+            .range  = sizeof(UniformBufferObject),
+        };
+
+        // Binding 1: Previous frame's storage buffer (used as input)
+        VkDescriptorBufferInfo storage_buffer_info_last_frame = {
+            .buffer = ctx.shader_storage_buffers[(i + MAX_FRAMES_IN_FLIGHT - 1) % MAX_FRAMES_IN_FLIGHT],
+            .offset = 0,
+            .range  = sizeof(Particle) * PARTICLE_COUNT,
+        };
+
+        // Binding 2: Current frame's storage buffer (used as output)
+        VkDescriptorBufferInfo storage_buffer_info_current_frame = {
+            .buffer = ctx.shader_storage_buffers[i],
+            .offset = 0,
+            .range  = sizeof(Particle) * PARTICLE_COUNT,
+        };
+
+        VkWriteDescriptorSet descriptor_writes[3] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = NULL,
+                .dstSet = ctx.compute_descriptor_sets[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &uniform_buffer_info,
+                .pImageInfo = NULL,
+                .pTexelBufferView = NULL
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = NULL,
+                .dstSet = ctx.compute_descriptor_sets[i],
+                .dstBinding = 2,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &storage_buffer_info_last_frame,
+                .pImageInfo = NULL,
+                .pTexelBufferView = NULL
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = NULL,
+                .dstSet = ctx.compute_descriptor_sets[i],
+                .dstBinding = 3,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &storage_buffer_info_current_frame,
+                .pImageInfo = NULL,
+                .pTexelBufferView = NULL
+            }
+        };
+
+        vkUpdateDescriptorSets(ctx.device, 3, descriptor_writes, 0, NULL);
+    }
+}
+void create_compute_pipeline() {
+    size_t out_size = 0;
+    char *shader_code = read_file("shaders/slang.spv", &out_size);
+    VkShaderModuleCreateInfo shader_module_create_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .codeSize = out_size,
+        .pCode = (uint32_t *)shader_code,
+    };
+
+    VkShaderModule shader_module;
+    VkResult vk_result = vkCreateShaderModule(ctx.device, &shader_module_create_info, NULL, &shader_module);
+    if (vk_result != VK_SUCCESS) {
+        free(shader_code);
+        fprintf(stderr, "Failed to create compute shader module! Error code: %d\n", vk_result);
+    }
+
+    VkPipelineShaderStageCreateInfo compute_shader_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shader_module,
+        .pName = "comp_main",
+        .pSpecializationInfo = NULL,
+    };
+
+    VkPipelineLayoutCreateInfo pipeline_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .setLayoutCount = 1,
+        .pSetLayouts = &ctx.compute_descriptor_set_layout,
+        .pushConstantRangeCount = 0,
+        .pPushConstantRanges = NULL
+    };
+
+    if (vkCreatePipelineLayout(ctx.device, &pipeline_layout_info, NULL, &ctx.compute_pipeline_layout) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create compute pipeline layout!\n");
+    }
+
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+        .stage = compute_shader_stage_info,
+        .layout = ctx.compute_pipeline_layout,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = -1
+    };
+
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &ctx.compute_pipeline) != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create compute pipeline!\n");
+    }
+
+    vkDestroyShaderModule(ctx.device, shader_module, NULL);
+}
+
 void create_graphics_pipeline() {
     size_t out_size = 0;
     char *shader_code = read_file("shaders/slang.spv", &out_size);
@@ -761,7 +956,7 @@ void create_graphics_pipeline() {
 
     VkVertexInputBindingDescription vertex_input_binding_desc = {
         .binding = 0,
-        .stride = sizeof(Vertex),
+        .stride = sizeof(Particle),
         .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
     };
     uint32_t vertex_input_attribute_count = 2;
@@ -769,13 +964,13 @@ void create_graphics_pipeline() {
     vertex_input_attribute_desc[0] = (VkVertexInputAttributeDescription){
         .location = 0,
         .binding = 0,
-        .format = VK_FORMAT_R32G32B32_SFLOAT,
+        .format = VK_FORMAT_R32G32_SFLOAT,
         .offset = offsetof(Vertex, pos)
     };
     vertex_input_attribute_desc[1] = (VkVertexInputAttributeDescription){
         .location = 1,
         .binding = 0,
-        .format = VK_FORMAT_R32G32_SFLOAT,
+        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
         .offset = offsetof(Vertex, tex_coord)
     };
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
@@ -792,7 +987,7 @@ void create_graphics_pipeline() {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .pNext = NULL,
         .flags = 0,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
         .primitiveRestartEnable = VK_FALSE
     };
 
@@ -1396,6 +1591,61 @@ void load_model() {
     tobj_scene_free(&scene);
 }
 
+void create_shader_storage_buffers() {
+    VkDeviceSize buffer_size = sizeof(Particle) * PARTICLE_COUNT;
+    Particle *particles = malloc(buffer_size);
+
+    srand((unsigned int)time(NULL));
+    for (int i = 0; i < PARTICLE_COUNT; i++) {
+        float r = 0.25f * sqrtf((float)rand() / RAND_MAX);
+        float theta = ((float)rand() / RAND_MAX) * 2.0f * 3.14159265358979323846f;
+        float x = r * cosf(theta) * HEIGHT / WIDTH;
+        float y = r * sinf(theta);
+
+        particles[i].position[0] = x;
+        particles[i].position[1] = y;
+
+        vec2 pos = {x, y};
+        glm_vec2_normalize(pos);
+        particles[i].velocity[0] = pos[0] * 0.00025f;
+        particles[i].velocity[1] = pos[1] * 0.00025f;
+
+        particles[i].color[0] = (float)rand() / RAND_MAX;
+        particles[i].color[1] = (float)rand() / RAND_MAX;
+        particles[i].color[2] = (float)rand() / RAND_MAX;
+        particles[i].color[3] = 1.0f;
+    }
+
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_buffer_memory;
+    create_buffer(buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer, &staging_buffer_memory);
+
+    void *data;
+    vkMapMemory(ctx.device, staging_buffer_memory, 0, buffer_size, 0, &data);
+    memcpy(data, particles, buffer_size);
+    vkUnmapMemory(ctx.device, staging_buffer_memory);
+
+    free(particles);
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        create_buffer(buffer_size,
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx.shader_storage_buffers[i], &ctx.shader_storage_buffers_memory[i]);
+
+        copy_buffer(staging_buffer, ctx.shader_storage_buffers[i], buffer_size);
+    }
+
+    if (staging_buffer_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(ctx.device, staging_buffer_memory, NULL);
+    }
+    if (staging_buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(ctx.device, staging_buffer, NULL);
+    }
+}
+
+
 void create_vertex_buffer() {
     VkDeviceSize buffer_size = sizeof(ctx.vertices[0]) * ctx.vertex_count;
 
@@ -1461,6 +1711,33 @@ void create_uniform_buffer() {
         }
     }
 }
+
+void create_compute_descriptor_pool() {
+    VkDescriptorPoolSize pool_sizes[2] = {
+        {
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = MAX_FRAMES_IN_FLIGHT
+        },
+        {
+            .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = MAX_FRAMES_IN_FLIGHT * 2
+        }
+    };
+
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .pNext = NULL,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .maxSets = MAX_FRAMES_IN_FLIGHT,
+        .poolSizeCount = 2,
+        .pPoolSizes = pool_sizes
+    };
+
+    if (vkCreateDescriptorPool(ctx.device, &pool_info, NULL, &ctx.compute_descriptor_pool) != VK_SUCCESS) {
+        fprintf(stderr, "failed to create compute descriptor pool!\n");
+    }
+}
+
 
 void create_descriptor_pool() {
     VkDescriptorPoolSize pool_sizes[] = {
@@ -1563,6 +1840,33 @@ void record_command_buffer(uint32_t image_index) {
         fprintf(stderr, "Failed to begin recording command buffer! Error code: %d\n", vk_result);
     }
 
+        vkCmdBindPipeline(ctx.command_buffers[ctx.frame_index], VK_PIPELINE_BIND_POINT_COMPUTE, ctx.compute_pipeline);
+        vkCmdBindDescriptorSets(ctx.command_buffers[ctx.frame_index], VK_PIPELINE_BIND_POINT_COMPUTE,
+                ctx.compute_pipeline_layout, 0, 1, &ctx.compute_descriptor_sets[ctx.frame_index], 0, NULL);
+
+        vkCmdDispatch(ctx.command_buffers[ctx.frame_index], PARTICLE_COUNT / 256, 1, 1);
+
+        VkMemoryBarrier2 memory_barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .pNext = NULL,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT,
+            .dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT
+        };
+        VkDependencyInfo dep_info = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = NULL,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &memory_barrier,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = NULL,
+            .imageMemoryBarrierCount = 0,
+            .pImageMemoryBarriers = NULL
+        };
+        vkCmdPipelineBarrier2(ctx.command_buffers[ctx.frame_index], &dep_info);
+
     transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.color_image,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             0, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1635,7 +1939,7 @@ void record_command_buffer(uint32_t image_index) {
 
     vkCmdBeginRendering(ctx.command_buffers[ctx.frame_index], &rendering_info);
     vkCmdBindPipeline(ctx.command_buffers[ctx.frame_index], VK_PIPELINE_BIND_POINT_GRAPHICS, ctx.graphics_pipeline);
-    vkCmdBindVertexBuffers(ctx.command_buffers[ctx.frame_index], 0, 1, &ctx.vertex_buffer, (VkDeviceSize[]){0});
+    vkCmdBindVertexBuffers(ctx.command_buffers[ctx.frame_index], 0, 1, &ctx.shader_storage_buffers[ctx.frame_index], (VkDeviceSize[]){0});
     vkCmdBindIndexBuffer(ctx.command_buffers[ctx.frame_index], ctx.index_buffer, 0, VK_INDEX_TYPE_OF(ctx.indices));
     vkCmdBindDescriptorSets(ctx.command_buffers[ctx.frame_index], VK_PIPELINE_BIND_POINT_GRAPHICS,
             ctx.pipeline_layout, 0, 1, &ctx.descriptor_sets[ctx.frame_index], 0, NULL);
@@ -1653,7 +1957,8 @@ void record_command_buffer(uint32_t image_index) {
         .extent = ctx.swapchain_extent
     };
     vkCmdSetScissor(ctx.command_buffers[ctx.frame_index], 0, 1, &scissor);
-    vkCmdDrawIndexed(ctx.command_buffers[ctx.frame_index], ctx.indices_count, 1, 0, 0, 0);
+    // vkCmdDrawIndexed(ctx.command_buffers[ctx.frame_index], ctx.indices_count, 1, 0, 0, 0);
+    vkCmdDraw(ctx.command_buffers[ctx.frame_index], PARTICLE_COUNT, 1, 0, 0);
     vkCmdEndRendering(ctx.command_buffers[ctx.frame_index]);
 
     transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.swapchain_images[image_index],
@@ -1779,8 +2084,10 @@ void init_vulkan() {
     create_swapchain();
     create_image_views();
     create_descriptor_set_layout();
+    create_compute_descriptor_set_layout();
     create_color_resources();
     create_depth_resources();
+    create_compute_pipeline();
     create_graphics_pipeline();
     create_command_pool();
     create_texture_image();
@@ -1789,7 +2096,10 @@ void init_vulkan() {
     load_model();
     create_vertex_buffer();
     create_index_buffer();
+    create_shader_storage_buffers();
     create_uniform_buffer();
+    create_compute_descriptor_pool();
+    create_compute_descriptor_sets();
     create_descriptor_pool();
     create_descriptor_sets();
     create_command_buffers();
@@ -1797,13 +2107,19 @@ void init_vulkan() {
 }
 
 void update_uniform_buffer(uint32_t current_image) {
-    float time = (float)glfwGetTime();
+    static double last_time = 0.0;
+    if (last_time == 0.0) last_time = glfwGetTime();
+
+    double current_time = glfwGetTime();
+    double last_frame_time = (current_time - last_time) * 1000.0;
+    last_time = current_time;
 
     UniformBufferObject ubo = {0};
+    ubo.delta_time = last_frame_time * 2.0f;
 
     glm_mat4_identity(ubo.model);
     vec3 rotation_axis = {0.0f, 0.0f, 1.0f};
-    float angle_in_rad = time * glm_rad(90.0f);
+    float angle_in_rad = current_time * glm_rad(90.0f);
     glm_rotate(ubo.model, angle_in_rad, rotation_axis);
 
     vec3 eye    = {2.0f, 2.0f, 2.0f};
@@ -1923,6 +2239,18 @@ void main_loop() {
 }
 
 void cleanup() {
+    vkDestroyPipeline(ctx.device, ctx.compute_pipeline, NULL);
+    vkDestroyPipelineLayout(ctx.device, ctx.compute_pipeline_layout, NULL);
+    vkDestroyDescriptorSetLayout(ctx.device, ctx.compute_descriptor_set_layout, NULL);
+    vkDestroyDescriptorPool(ctx.device, ctx.compute_descriptor_pool, NULL);
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        if (ctx.shader_storage_buffers[i] != VK_NULL_HANDLE) {
+            vkDestroyBuffer(ctx.device, ctx.shader_storage_buffers[i], NULL);
+        }
+        if (ctx.shader_storage_buffers_memory[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(ctx.device, ctx.shader_storage_buffers_memory[i], NULL);
+        }
+    }
     if (ctx.texture_sampler != VK_NULL_HANDLE) {
         vkDestroySampler(ctx.device, ctx.texture_sampler, NULL);
     }
