@@ -17,13 +17,27 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "libs/stb_image.h"
 
+#define TINYOBJ_LOADER_C_IMPLEMENTATION
+#define TOBJ_ENABLE_FILE_IO
+#include "libs/tinyobjloader/tiny_obj_c.h"
+#include "libs/tinyobjloader/tiny_obj_c.c"
+#include "libs/tinyobjloader/tobj_tess.c"
+
 #include "vulkan/vulkan_core.h"
 
 #define CLAMP(val, min, max) ((val) < (min) ? (min) : ((val) > (max) ? (max) : (val)))
 
+#define VK_INDEX_TYPE_OF(var) _Generic((var)[0], \
+    uint16_t: VK_INDEX_TYPE_UINT16,              \
+    uint32_t: VK_INDEX_TYPE_UINT32,              \
+    default:  VK_INDEX_TYPE_NONE_KHR             \
+)
+
 constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
+const char *MODEL_PATH = "models/viking_room.obj";
+const char *TEXTURE_PATH = "textures/viking_room.png";
 
 const char *validation_layers[] = { "VK_LAYER_KHRONOS_validation" };
 constexpr uint32_t validation_layer_count = sizeof(validation_layers) / sizeof(validation_layers[0]);
@@ -33,6 +47,11 @@ constexpr bool enable_validation_layers = false;
 #else
 constexpr bool enable_validation_layers = true;
 #endif
+
+typedef struct Vertex {
+    vec3 pos;
+    vec2 tex_coord;
+} Vertex;
 
 typedef struct Vulkan_Context {
     GLFWwindow *window;
@@ -59,6 +78,10 @@ typedef struct Vulkan_Context {
     VkSemaphore present_complete_semaphores[MAX_FRAMES_IN_FLIGHT];
     VkSemaphore *render_finished_semaphores;
     VkFence in_flight_fences[MAX_FRAMES_IN_FLIGHT];
+    Vertex *vertices;
+    uint32_t vertex_count;
+    uint32_t  *indices;
+    uint32_t indices_count;
     VkBuffer vertex_buffer;
     VkDeviceMemory vertex_buffer_memory;
     VkBuffer index_buffer;
@@ -88,28 +111,6 @@ typedef struct UniformBufferObject {
 } UniformBufferObject;
 
 Vulkan_Context ctx = { 0 };
-
-typedef struct Vertex {
-    vec3 pos;
-    vec2 tex_coord;
-} Vertex;
-
-const Vertex vertices[] = {
-    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}},
-
-    {{-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f}},
-    {{0.5f, -0.5f, -0.5f}, {1.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {1.0f, 1.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {0.0f, 1.0f}}
-};
-
-const uint16_t indices[] = {
-    0, 1, 2, 2, 3, 0,
-    4, 5, 6, 6, 7, 4
-};
 
 void framebufferResizeCallback(GLFWwindow *window, int width, int height) {
     ctx.frame_buffer_resized = true;
@@ -1114,7 +1115,7 @@ void copy_buffer_to_image(VkCommandBuffer command_buffer, VkBuffer buffer,
 
 void create_texture_image() {
     int tex_width, tex_height, tex_channels;
-    stbi_uc *pixels    = stbi_load("textures/texture.jpg", &tex_width, &tex_height, &tex_channels, STBI_rgb_alpha);
+    stbi_uc *pixels    = stbi_load(TEXTURE_PATH, &tex_width, &tex_height, &tex_channels, STBI_rgb_alpha);
     VkDeviceSize image_size = tex_width * tex_height * 4;
 
     VkBuffer staging_buffer;
@@ -1194,8 +1195,60 @@ void create_texture_sampler() {
     }
 }
 
+void load_model() {
+    // TODO: Vertex deduplication
+    tobj_scene_f scene = {0};
+    tobj_load_config cfg = {0};
+
+    tobj_result result = tobj_load_obj_from_file(&scene, MODEL_PATH, &cfg, NULL);
+    if (result != 0) {
+        fprintf(stderr, "Failed to load OBJ model file! Error code: %d\n", result);
+    }
+
+    ctx.indices_count = 0;
+    for (size_t s = 0; s < scene.num_shapes; s++) {
+        ctx.indices_count += scene.shapes[s].mesh.num_indices;
+    }
+
+    ctx.vertex_count = ctx.indices_count;
+
+    ctx.vertices = malloc(sizeof(Vertex) * ctx.vertex_count);
+    ctx.indices  = malloc(sizeof(uint32_t) * ctx.indices_count);
+
+    uint32_t global_v_idx = 0;
+
+    for (size_t s = 0; s < scene.num_shapes; s++) {
+        tobj_shape_f* shape = &scene.shapes[s];
+        uint32_t num_indices_in_shape = shape->mesh.num_indices;
+
+        for (size_t i = 0; i < num_indices_in_shape; i++) {
+            int pos_idx = shape->mesh.indices[i].vertex_index;
+            int tex_idx = shape->mesh.indices[i].texcoord_index;
+
+            ctx.vertices[global_v_idx].pos[0] = scene.attrib.vertices.ptr[3 * pos_idx + 0];
+            ctx.vertices[global_v_idx].pos[1] = scene.attrib.vertices.ptr[3 * pos_idx + 1];
+            ctx.vertices[global_v_idx].pos[2] = scene.attrib.vertices.ptr[3 * pos_idx + 2];
+
+            if (tex_idx >= 0) {
+                ctx.vertices[global_v_idx].tex_coord[0] = scene.attrib.texcoords.ptr[2 * tex_idx + 0];
+                ctx.vertices[global_v_idx].tex_coord[1] = 1.0f - scene.attrib.texcoords.ptr[2 * tex_idx + 1];
+            } else {
+                ctx.vertices[global_v_idx].tex_coord[0] = 0.0f;
+                ctx.vertices[global_v_idx].tex_coord[1] = 0.0f;
+            }
+
+            ctx.indices[global_v_idx] = global_v_idx;
+            global_v_idx++;
+        }
+    }
+
+    printf("Vertices generated: %u | Indices generated: %u\n", ctx.vertex_count, ctx.indices_count);
+
+    tobj_scene_free(&scene);
+}
+
 void create_vertex_buffer() {
-    VkDeviceSize buffer_size = sizeof(vertices);
+    VkDeviceSize buffer_size = sizeof(ctx.vertices[0]) * ctx.vertex_count;
 
     VkBuffer staging_buffer;
     VkDeviceMemory staging_buffer_memory;
@@ -1205,7 +1258,7 @@ void create_vertex_buffer() {
 
     void *data;
     vkMapMemory(ctx.device, staging_buffer_memory, 0, buffer_size, 0, &data);
-    memcpy(data, vertices, buffer_size);
+    memcpy(data, ctx.vertices, buffer_size);
     vkUnmapMemory(ctx.device, staging_buffer_memory);
 
     create_buffer(buffer_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1221,7 +1274,7 @@ void create_vertex_buffer() {
 }
 
 void create_index_buffer() {
-    VkDeviceSize buffer_size = sizeof(indices);
+    VkDeviceSize buffer_size = sizeof(ctx.indices[0]) * ctx.indices_count;
 
     VkBuffer staging_buffer;
     VkDeviceMemory staging_buffer_memory;
@@ -1231,7 +1284,7 @@ void create_index_buffer() {
 
     void *data;
     vkMapMemory(ctx.device, staging_buffer_memory, 0, buffer_size, 0, &data);
-    memcpy(data, indices, buffer_size);
+    memcpy(data, ctx.indices, buffer_size);
     vkUnmapMemory(ctx.device, staging_buffer_memory);
 
     create_buffer(buffer_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1428,7 +1481,7 @@ void record_command_buffer(uint32_t image_index) {
     vkCmdBeginRendering(ctx.command_buffers[ctx.frame_index], &rendering_info);
     vkCmdBindPipeline(ctx.command_buffers[ctx.frame_index], VK_PIPELINE_BIND_POINT_GRAPHICS, ctx.graphics_pipeline);
     vkCmdBindVertexBuffers(ctx.command_buffers[ctx.frame_index], 0, 1, &ctx.vertex_buffer, (VkDeviceSize[]){0});
-    vkCmdBindIndexBuffer(ctx.command_buffers[ctx.frame_index], ctx.index_buffer, 0, VK_INDEX_TYPE_UINT16);
+    vkCmdBindIndexBuffer(ctx.command_buffers[ctx.frame_index], ctx.index_buffer, 0, VK_INDEX_TYPE_OF(ctx.indices));
     vkCmdBindDescriptorSets(ctx.command_buffers[ctx.frame_index], VK_PIPELINE_BIND_POINT_GRAPHICS,
             ctx.pipeline_layout, 0, 1, &ctx.descriptor_sets[ctx.frame_index], 0, NULL);
     VkViewport viewport = {
@@ -1445,7 +1498,7 @@ void record_command_buffer(uint32_t image_index) {
         .extent = ctx.swapchain_extent
     };
     vkCmdSetScissor(ctx.command_buffers[ctx.frame_index], 0, 1, &scissor);
-    vkCmdDrawIndexed(ctx.command_buffers[ctx.frame_index], sizeof(indices) / sizeof(indices[0]), 1, 0, 0, 0);
+    vkCmdDrawIndexed(ctx.command_buffers[ctx.frame_index], ctx.indices_count, 1, 0, 0, 0);
     vkCmdEndRendering(ctx.command_buffers[ctx.frame_index]);
 
     transition_image_layout(ctx.command_buffers[ctx.frame_index], ctx.swapchain_images[image_index],
@@ -1564,6 +1617,7 @@ void init_vulkan() {
     create_texture_image();
     create_texture_image_view();
     create_texture_sampler();
+    load_model();
     create_vertex_buffer();
     create_index_buffer();
     create_uniform_buffer();
